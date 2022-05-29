@@ -1,12 +1,12 @@
 import argparse
+import contextlib
 import dataclasses
 from datetime import datetime, timedelta
 import json
 import sqlalchemy
 from sqlalchemy import Column, Integer
-from sqlalchemy.orm import (
-    declarative_base, make_transient, make_transient_to_detached, sessionmaker
-)
+from sqlalchemy.orm import declarative_base, sessionmaker
+
 from typing import List, Optional, Union
 import re
 
@@ -26,7 +26,7 @@ raven_sessionmaker = None
 # Code is a bit hacky for now as we need to divide each section into its
 # individual modules.
 # ========== Debug ==========
-@raven_bot.command()
+@raven_bot.command(hidden=True)
 async def echo(ctx, msg):
     await ctx.send(f"```{msg}```")
 
@@ -51,48 +51,60 @@ class GuildConfig(Base):
         return cfg.host_role_id is None or any(
             r.id == cfg.host_role_id for r in ctx.author.roles)
 
-    def configure(self, ctx, key, value):
-        if key not in ("host_role_id", "queue_channel", "default_queue_size"):
-            return f"Invalid configuration setting {key}."
-        
-        # TODO: This should be done with SQLAlchemy types.
-        if key == "queue_channel":
-            if not isinstance(value, nextcord.TextChannel):
-                return "Invalid argument. Required a channel, e.g., #general."
-            permissions = value.permissions_for(ctx.me)
-            if not permissions.send_messages and permissions.read_messages:
-                return f"Bot does not have permissions for: {channel.mention}"
-            self.queue_channel = value.id
-            return 
-        elif key == "host_role_id":
-            if value is not None or not isinstance(value, nextcord.Role):
-                return "Invalid argument. Required a role, e.g., @Members."
-            if value is not None:
-                value = value.id
-            self.host_role_id = value
-        elif key == "default_queue_size":
-            if not isinstance(value, int):
-                return "Invalid argument. Required a number, e.g., 8."
-            self.default_queue_size = value
+
+class GuildConfigCog(commands.Cog, name="Server Configuration"):
+    @commands.group(invoke_without_command=True)
+    async def configure(self, ctx):
+        """Changes the bot's configuration for this server."""
+        await ctx.send_help("configure")
 
 
-@raven_bot.command()
-@commands.has_permissions(manage_guild=True)
-async def configure(
-    ctx, 
-    key: str, 
-    value: Union[nextcord.TextChannel, nextcord.Role, int, None] = None
-):
-    msg = None
-    with raven_sessionmaker() as session:
-        if ctx.guild.id not in GuildConfig.registry:
-            obj = GuildConfig(guild_id=ctx.guild.id)
-        else:
-            obj = session.merge(GuildConfig.registry[ctx.guild.id])
-        msg = obj.configure(ctx, key, value)
-        session.commit()
-    if msg:
-        await ctx.send(msg)
+    @contextlib.contextmanager
+    def guild_config(self, guild_id):
+        with raven_sessionmaker() as session:
+            if guild_id not in GuildConfig.registry:
+                obj = GuildConfig(guild_id=guild_id)
+                session.add(obj)
+            else:
+                obj = session.merge(GuildConfig.registry[guild_id])
+            yield obj
+            session.commit()
+
+    @configure.command()
+    async def default_queue_size(self, ctx, queue_size: Optional[int] = None):
+        """Sets the default queue size."""
+        if queue_size <= 0:
+            await ctx.reply(
+                "Default queue size must be greater than 0.",
+                delete_after=10.0
+            )
+            raise commands.CommandError("Invalid argument.")
+        with self.guild_config(ctx.guild.id) as guild_config:
+            guild_config.default_queue_size = queue_size
+        await ctx.reply("Settings updated.", delete_after=10.0)
+
+    @configure.command()
+    async def queue_channel(self, ctx, channel: nextcord.TextChannel):
+        """Sets the channel for the bot to listen to."""
+        permissions = channel.permissions_for(ctx.me)
+        if not permissions.send_messages and permissions.read_messages:
+            await ctx.reply(
+                "Bot does not have permissions for: {channel.mention}",
+                delete_after=10.0
+            )
+            raise commands.CommandError("Bot does not have permissions.")
+        with self.guild_config(ctx.guild.id) as guild_config:
+            guild_config.queue_channel = channel.id
+        await ctx.reply("Settings updated.", delete_after=10.0)
+
+    @configure.command()
+    async def host_role(self, ctx, role: Optional[nextcord.Role] = None):
+        """
+        Restrict hosts to specified role. Empty allows everyone.
+        """
+        with self.guild_config(ctx.guild.id) as guild_config:
+            guild_config.host_role_id = None if role is None else role.id
+        await ctx.reply("Settings updated.", delete_after=10.0)
 
 
 # ========== Lobby management ==========
@@ -111,7 +123,7 @@ class LobbyState:
     queue_size : int    
     start_time : datetime
     end_time : datetime
-    queue : List[int]
+    queue : List[QueueJoin]
 
     def __init__(self, guild_id):
         self.guild_id = guild_id
@@ -216,4 +228,5 @@ if __name__ == "__main__":
         guild_configs = session.query(GuildConfig).all()
         GuildConfig.registry = {gc.guild_id : gc for gc in guild_configs}
 
+    raven_bot.add_cog(GuildConfigCog())
     raven_bot.run(keyring["discord_api_token"])
